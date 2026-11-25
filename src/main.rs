@@ -22,12 +22,28 @@ struct Config {
 fn fail<T>(s: &str) -> Result<T> {
     Err(s.into())
 }
+/// Builds a `git` command. Unit tests ignore the developer's global and system
+/// Git configuration (signing, hooks, URL rewrites) so they behave the same everywhere.
+fn git_bin() -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new("git");
+    #[cfg(test)]
+    {
+        let empty = env::temp_dir().join("obvault-test-empty-gitconfig");
+        let _ = fs::write(&empty, "");
+        cmd.env("GIT_CONFIG_GLOBAL", empty)
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+    }
+    cmd
+}
+/// Builds a `git -C <path>` command.
+fn git_cmd(path: &Path) -> Command {
+    let mut cmd = git_bin();
+    cmd.arg("-C").arg(path);
+    cmd
+}
 fn git(path: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .output()?;
+    let out = git_cmd(path).args(args).output()?;
     if !out.status.success() {
         return fail(&format!(
             "git {}: {}",
@@ -38,13 +54,7 @@ fn git(path: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim_end().to_owned())
 }
 fn show(path: &Path, args: &[&str]) -> Result<()> {
-    if !Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .status()?
-        .success()
-    {
+    if !git_cmd(path).args(args).status()?.success() {
         return fail("Git command failed.");
     }
     Ok(())
@@ -113,16 +123,16 @@ fn prompt(label: &str, default: &str) -> Result<String> {
         s.trim().to_owned()
     })
 }
+/// Shows `text` once, then asks a yes/no question until it gets a valid answer.
 fn confirm(text: &str) -> Result<()> {
-    let accepted = validated(&format!("{text}\nContinue? y/N"), "N", |input| match input
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "y" | "yes" => Ok(true),
-        "n" | "no" => Ok(false),
-        _ => fail("Enter y or n."),
-    })?;
-    if accepted { Ok(()) } else { fail("Cancelled.") }
+    println!("{text}");
+    loop {
+        match prompt("Continue? y/N", "N")?.to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(()),
+            "n" | "no" => return fail("Cancelled."),
+            _ => println!("Enter y or n."),
+        }
+    }
 }
 fn expand(s: &str) -> PathBuf {
     if s == "~" || s.starts_with("~/") {
@@ -195,6 +205,15 @@ fn fetch(v: &Vault) -> Result<()> {
     git(&v.path, &["fetch", "origin"])?;
     Ok(())
 }
+/// True when `rev` is already contained in local HEAD (a normal push would fast-forward).
+fn is_ancestor(path: &Path, rev: &str) -> Result<bool> {
+    Ok(git_cmd(path)
+        .args(["merge-base", "--is-ancestor", rev, "HEAD"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success())
+}
 fn remote(v: &Vault) -> String {
     format!("refs/remotes/origin/{}", v.branch)
 }
@@ -250,14 +269,7 @@ fn status(v: &Vault) -> Result<()> {
 fn push(v: &Vault, message: &str) -> Result<()> {
     ready(v)?;
     fetch(v)?;
-    if remote_oid(v)?.is_some()
-        && !Command::new("git")
-            .arg("-C")
-            .arg(&v.path)
-            .args(["merge-base", "--is-ancestor", &remote(v), "HEAD"])
-            .status()?
-            .success()
-    {
+    if remote_oid(v)?.is_some() && !is_ancestor(&v.path, &remote(v))? {
         return fail(
             "GitHub has changes not present locally. Pull first; diverged histories require manual resolution. No files were changed.",
         );
@@ -388,9 +400,7 @@ fn validated<T>(label: &str, default: &str, mut check: impl FnMut(&str) -> Resul
     }
 }
 fn repository_refs(path: &Path, repo: &str) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(path)
+    let out = git_cmd(path)
         .args(["ls-remote", "--heads", "--", repo])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "Never")
@@ -402,6 +412,152 @@ fn repository_refs(path: &Path, repo: &str) -> Result<String> {
         ));
     }
     Ok(String::from_utf8(out.stdout)?)
+}
+/// Changes setup made to an existing folder, so they can be reverted on cancel.
+#[derive(Default)]
+struct Undo {
+    created_git: bool,
+    /// Original `origin` URL (`None` when there was no origin) if setup changed it.
+    origin: Option<Option<String>>,
+}
+impl Undo {
+    fn revert(&self, path: &Path) {
+        if self.created_git {
+            // Only ever removes a repository this setup run created moments earlier.
+            let _ = fs::remove_dir_all(path.join(".git"));
+            return;
+        }
+        let _ = match &self.origin {
+            Some(Some(url)) => git(path, &["remote", "set-url", "origin", url]),
+            Some(None) => git(path, &["remote", "remove", "origin"]),
+            None => return,
+        };
+        println!("Setup cancelled; repository settings were restored.");
+    }
+}
+/// What `upload` should do once every question has been answered.
+struct UploadPlan {
+    /// Remote commit to replace (after backing it up), when histories are unrelated.
+    replace: Option<String>,
+    /// Remote commit holding only starter files (README, LICENSE...) to keep alongside the vault.
+    starter: Option<String>,
+}
+/// True when a remote branch holds only the files GitHub offers when creating a repository.
+fn starter_only(files: &str) -> bool {
+    files.lines().all(|f| {
+        let lower = f.to_ascii_lowercase();
+        !f.contains('/')
+            && (lower.starts_with("readme")
+                || lower.starts_with("license")
+                || lower.starts_with("licence")
+                || lower == ".gitignore"
+                || lower == ".gitattributes")
+    })
+}
+/// Prepares a local folder for workflows 1 and 3 and asks every question up front.
+/// Nothing is committed or uploaded here; changes made are recorded in `undo`.
+fn connect_local(
+    upload: bool,
+    path: &Path,
+    repo: &str,
+    branch: &str,
+    detected: &str,
+    undo: &mut Undo,
+) -> Result<(Vault, Option<UploadPlan>)> {
+    if !path.is_dir() {
+        return fail("Local vault folder does not exist.");
+    }
+    if !path.join(".git").exists() {
+        if !upload {
+            return fail("No Git repository found at this folder.");
+        }
+        git(path, &["init", "-b", branch])?;
+        undo.created_git = true;
+    }
+    if !detected.is_empty() && detected != repo {
+        confirm(&format!("Change origin from {detected} to {repo}?"))?;
+        git(path, &["remote", "set-url", "origin", repo])?;
+        undo.origin = Some(Some(detected.to_owned()));
+    } else if detected.is_empty() {
+        git(path, &["remote", "add", "origin", repo])?;
+        undo.origin = Some(None);
+    }
+    let v = Vault {
+        path: fs::canonicalize(path)?,
+        repo: repo.to_owned(),
+        branch: branch.to_owned(),
+    };
+    ready(&v)?;
+    println!("OK: Local repository connected.");
+    if !upload {
+        return Ok((v, None));
+    }
+    if git(&v.path, &["var", "GIT_COMMITTER_IDENT"]).is_err() {
+        return fail(
+            "Git needs your name and email before committing. Run: git config --global user.name \"Your Name\" and git config --global user.email you@example.com",
+        );
+    }
+    fetch(&v)?;
+    let mut plan = UploadPlan {
+        replace: None,
+        starter: None,
+    };
+    if let Some(oid) = remote_oid(&v)? {
+        if !is_ancestor(&v.path, &oid)? {
+            let files = git(&v.path, &["ls-tree", "-r", "--name-only", &oid])?;
+            if starter_only(&files) {
+                println!(
+                    "GitHub branch only has starter files ({}). They will be kept; your vault's files win if names match.",
+                    files.lines().collect::<Vec<_>>().join(", ")
+                );
+                plan.starter = Some(oid);
+            } else {
+                confirm(&format!(
+                    "Use your local vault as the starting version on GitHub?\nRepository: {}\nBranch: {}\nThis will REPLACE this branch's files and history with your local vault.\nExisting remote history will first be saved and verified on obvault-backup-<timestamp>.\nIf backup fails or the remote branch changes, replacement stops.",
+                    v.repo, v.branch
+                ))?;
+                plan.replace = Some(oid);
+            }
+        }
+    }
+    confirm(
+        "Upload local vault files? Local .obsidian settings, trash, and common secret files will be ignored. Already tracked files remain tracked; review them with Git first.",
+    )?;
+    Ok((v, Some(plan)))
+}
+/// Commits the vault and uploads it. Runs only after the user confirmed everything.
+fn upload(v: &Vault, plan: UploadPlan) -> Result<()> {
+    ignore(&v.path)?;
+    git(&v.path, &["add", "--all"])?;
+    if !git(&v.path, &["diff", "--cached", "--name-only"])?.is_empty() {
+        git(
+            &v.path,
+            &["commit", "-m", "Set up Obsidian vault with obvault"],
+        )?;
+    }
+    if let Some(oid) = plan.starter {
+        // Unrelated histories: join them, preferring the vault's version of any clashing file.
+        git(
+            &v.path,
+            &[
+                "merge",
+                "--allow-unrelated-histories",
+                "-X",
+                "ours",
+                "--no-edit",
+                "-m",
+                "Keep starter files from GitHub",
+                &oid,
+            ],
+        )?;
+    }
+    match plan.replace {
+        Some(old) => {
+            println!("Remote history preserved on {}", replace_remote(v, &old)?);
+            Ok(())
+        }
+        None => push(v, "Set up vault"),
+    }
 }
 fn setup(c: &mut Config, cp: &Path, name: &str) -> Result<()> {
     let existing = c.vaults.get(name).cloned();
@@ -531,11 +687,11 @@ fn setup(c: &mut Config, cp: &Path, name: &str) -> Result<()> {
             Ok(input.to_owned())
         },
     )?;
-    if mode == "2" {
+    let v = if mode == "2" {
         if path.exists() && fs::read_dir(&path)?.next().is_some() {
             return fail("Download requires a new or empty destination folder.");
         }
-        if !Command::new("git")
+        if !git_bin()
             .args(["clone", "--branch", &b, "--", &repo])
             .arg(&path)
             .status()?
@@ -543,74 +699,31 @@ fn setup(c: &mut Config, cp: &Path, name: &str) -> Result<()> {
         {
             return fail("Clone failed; configuration was not saved.");
         }
-    } else {
-        if !path.is_dir() {
-            return fail("Local vault folder does not exist.");
-        }
-        if !path.join(".git").exists() {
-            if mode == "3" {
-                return fail("No Git repository found at this folder.");
-            }
-            git(&path, &["init", "-b", &b])?;
-        }
-        if !detected.is_empty() && detected != repo {
-            confirm(&format!("Change origin from {detected} to {repo}?"))?;
-            git(&path, &["remote", "set-url", "origin", &repo])?;
-        } else if detected.is_empty() {
-            git(&path, &["remote", "add", "origin", &repo])?;
-        }
-    }
-    let v = Vault {
-        path: fs::canonicalize(path)?,
-        repo,
-        branch: b,
-    };
-    ready(&v)?;
-    println!("OK: Local repository connected.");
-    if mode == "1" {
-        fetch(&v)?;
-        let old = remote_oid(&v)?;
-        let replace = if let Some(ref oid) = old {
-            let compatible = Command::new("git")
-                .arg("-C")
-                .arg(&v.path)
-                .args(["merge-base", "--is-ancestor", oid, "HEAD"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()?
-                .success();
-            if !compatible {
-                confirm(&format!(
-                    "Use your local vault as the starting version on GitHub?\nRepository: {}\nBranch: {}\nThis will REPLACE this branch's files and history with your local vault.\nExisting remote history will first be saved and verified on obvault-backup-<timestamp>.\nIf backup fails or the remote branch changes, replacement stops.",
-                    v.repo, v.branch
-                ))?;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
+        let v = Vault {
+            path: fs::canonicalize(&path)?,
+            repo,
+            branch: b,
         };
-        confirm(
-            "Upload local vault files? Local .obsidian settings, trash, and common secret files will be ignored. Already tracked files remain tracked; review them with Git first.",
-        )?;
-        ignore(&v.path)?;
-        git(&v.path, &["add", "--all"])?;
-        if !git(&v.path, &["diff", "--cached", "--name-only"])?.is_empty() {
-            git(
-                &v.path,
-                &["commit", "-m", "Set up Obsidian vault with obvault"],
-            )?;
+        ready(&v)?;
+        println!("OK: Local repository connected.");
+        v
+    } else {
+        // Anything setup changes before the user's final "yes" is recorded and undone
+        // if they cancel or a check fails, so declining leaves the folder untouched.
+        let mut undo = Undo::default();
+        match connect_local(mode == "1", &path, &repo, &b, &detected, &mut undo) {
+            Ok((v, plan)) => {
+                if let Some(plan) = plan {
+                    upload(&v, plan)?;
+                }
+                v
+            }
+            Err(e) => {
+                undo.revert(&path);
+                return Err(e);
+            }
         }
-        if replace {
-            println!(
-                "Remote history preserved on {}",
-                replace_remote(&v, old.as_deref().unwrap())?
-            );
-        } else {
-            push(&v, "Set up vault")?;
-        }
-    }
+    };
     c.vaults.insert(name.into(), v);
     if c.default.is_empty() {
         c.default = name.into();
