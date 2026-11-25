@@ -26,7 +26,7 @@ obvault setup
 obvault setup --vault work
 ```
 
-Select a detected Obsidian vault or enter a path. Accepts spaces, relative paths and `~`. Supply a GitHub HTTPS or SSH URL and a branch. Workflows:
+Choose a workflow first, then select a detected Obsidian vault or enter a path. Every entry is checked immediately: successful steps print `OK`, while invalid entries explain the problem and repeat the same prompt. Repository validation checks access using existing Git authentication; offline or inaccessible repositories must be corrected before continuing. Download setup also checks that the remote branch exists. Ctrl+C cancels setup. Accepts spaces, relative paths and `~`. Supply a GitHub HTTPS or SSH URL and a branch. Workflows:
 
 1. **Upload local vault:** initialize Git when necessary, add ignore rules, commit and upload. If the remote branch cannot be advanced normally, setup explicitly asks before replacing it. It first creates and verifies `obvault-backup-<timestamp>` on GitHub, then uses a lease-protected push. Backup failure or a changed remote branch prevents replacement. Any backup already created is retained.
 2. **Download:** clone an existing remote branch into a new or empty destination.

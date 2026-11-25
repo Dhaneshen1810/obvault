@@ -64,21 +64,58 @@ fn setup_and_restore_snapshot_preserve_history() {
     fs::write(vault.join("added.md"), "later").unwrap();
     git(&vault, &["add", "."]);
     git(&vault, &["commit", "-m", "second"]);
+    git(&root, &["init", "--bare", "vault.git"]);
+    let replacement = format!("{}/", root.to_string_lossy().replace('\\', "/"));
+    git(
+        &vault,
+        &[
+            "config",
+            &format!("url.{replacement}.insteadOf"),
+            "https://github.com/test/",
+        ],
+    );
     let config = root.join("config.json");
     let setup = cli(
         &config,
         &["setup"],
-        &format!("{}\n\n\n3\n", vault.display()),
+        &format!(
+            "invalid\n3\n{}\n{}\nbad-url\nhttps://github.com/test/missing.git\n\nbad branch\nwrong-branch\nmain\n",
+            root.join("missing").display(),
+            vault.display()
+        ),
     );
     assert!(
         setup.status.success(),
-        "{}",
+        "{}\n{}",
+        String::from_utf8_lossy(&setup.stdout),
         String::from_utf8_lossy(&setup.stderr)
     );
+    let output = String::from_utf8_lossy(&setup.stdout);
+    for expected in [
+        "Choose 1, 2, or 3",
+        "Local vault folder does not exist",
+        "Use https://github.com/OWNER/REPO",
+        "Cannot access repository",
+        "Local repository is on branch",
+        "OK: Workflow validated",
+        "OK: Local vault path",
+        "OK: GitHub repository",
+        "OK: Branch validated",
+    ] {
+        assert!(output.contains(expected), "Missing {expected}: {output}");
+    }
+    let saved = fs::read(&config).unwrap();
+    let cancelled = cli(
+        &config,
+        &["setup"],
+        &format!("3\n{}\n", root.join("missing").display()),
+    );
+    assert!(!cancelled.status.success());
+    assert_eq!(fs::read(&config).unwrap(), saved);
     let no = cli(&config, &["revert", &first], "n\n");
     assert!(!no.status.success());
     assert_eq!(fs::read_to_string(vault.join("note.md")).unwrap(), "new");
-    let yes = cli(&config, &["revert", &first], "y\n");
+    let yes = cli(&config, &["revert", &first], "invalid\ny\n");
     assert!(
         yes.status.success(),
         "{}",

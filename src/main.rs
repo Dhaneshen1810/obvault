@@ -114,11 +114,15 @@ fn prompt(label: &str, default: &str) -> Result<String> {
     })
 }
 fn confirm(text: &str) -> Result<()> {
-    if prompt(&format!("{text}\nContinue? y/N"), "N")?.eq_ignore_ascii_case("y") {
-        Ok(())
-    } else {
-        fail("Cancelled.")
-    }
+    let accepted = validated(&format!("{text}\nContinue? y/N"), "N", |input| match input
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => fail("Enter y or n."),
+    })?;
+    if accepted { Ok(()) } else { fail("Cancelled.") }
 }
 fn expand(s: &str) -> PathBuf {
     if s == "~" || s.starts_with("~/") {
@@ -174,7 +178,7 @@ fn ready(v: &Vault) -> Result<()> {
             );
         }
     }
-    if git(&v.path, &["remote", "get-url", "origin"])? != v.repo {
+    if git(&v.path, &["config", "--get", "remote.origin.url"])? != v.repo {
         return fail("Origin changed. Run setup again.");
     }
     branch(v)
@@ -371,8 +375,50 @@ fn discovered() -> Vec<PathBuf> {
         })
         .unwrap_or_default()
 }
+fn validated<T>(label: &str, default: &str, mut check: impl FnMut(&str) -> Result<T>) -> Result<T> {
+    loop {
+        let input = prompt(label, default)?;
+        match check(&input) {
+            Ok(value) => {
+                println!("OK: {label} validated.");
+                return Ok(value);
+            }
+            Err(error) => println!("Invalid entry: {error}\nPlease try again (Ctrl+C to cancel)."),
+        }
+    }
+}
+fn repository_refs(path: &Path, repo: &str) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["ls-remote", "--heads", "--", repo])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .output()?;
+    if !out.status.success() {
+        return fail(&format!(
+            "Cannot access repository. Check its URL, network and Git authentication. {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8(out.stdout)?)
+}
 fn setup(c: &mut Config, cp: &Path, name: &str) -> Result<()> {
     let existing = c.vaults.get(name).cloned();
+    println!(
+        "1. Upload local vault to GitHub\n2. Download GitHub vault into a new or empty folder\n3. Connect existing local Git repository (configuration only)"
+    );
+    let mode = validated(
+        "Workflow",
+        if existing.is_some() { "3" } else { "1" },
+        |input| {
+            if ["1", "2", "3"].contains(&input) {
+                Ok(input.to_owned())
+            } else {
+                fail("Choose 1, 2, or 3.")
+            }
+        },
+    )?;
     let found = discovered();
     for (i, p) in found.iter().enumerate() {
         println!("{}. {}", i + 1, p.display());
@@ -381,44 +427,110 @@ fn setup(c: &mut Config, cp: &Path, name: &str) -> Result<()> {
         .as_ref()
         .map(|v| v.path.display().to_string())
         .unwrap_or_default();
-    let input = prompt("Local vault path (or listed number)", &default)?;
-    let path = input
-        .parse::<usize>()
-        .ok()
-        .and_then(|i| i.checked_sub(1))
-        .and_then(|i| found.get(i).cloned())
-        .unwrap_or_else(|| expand(&input));
-    if input.is_empty() {
-        return fail("Vault path is required.");
-    }
-    let detected = git(&path, &["remote", "get-url", "origin"]).unwrap_or_default();
-    let repo = prompt(
+    let path = validated("Local vault path (or listed number)", &default, |input| {
+        if input.is_empty() {
+            return fail("Vault path is required.");
+        }
+        let path = if let Ok(number) = input.parse::<usize>() {
+            number
+                .checked_sub(1)
+                .and_then(|i| found.get(i).cloned())
+                .ok_or("Choose a listed number or enter a folder path.")?
+        } else {
+            expand(input)
+        };
+        if mode == "2" {
+            if path.exists() {
+                if !path.is_dir() {
+                    return fail("Destination must be a folder, not a file.");
+                }
+                if fs::read_dir(&path)?.next().is_some() {
+                    return fail("Download requires a new or empty destination folder.");
+                }
+            } else {
+                let absolute = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    env::current_dir()?.join(&path)
+                };
+                let mut parent = absolute.parent().ok_or("Invalid destination path")?;
+                while !parent.exists() {
+                    parent = parent
+                        .parent()
+                        .ok_or("Destination has no existing parent folder")?;
+                }
+                if !parent.is_dir() {
+                    return fail("Destination's parent is not a folder.");
+                }
+            }
+        } else {
+            if !path.is_dir() {
+                return fail("Local vault folder does not exist or is not a folder.");
+            }
+            fs::read_dir(&path)?;
+            if mode == "3" && !path.join(".git").exists() {
+                return fail("No Git repository found at this folder. Choose the repository root.");
+            }
+        }
+        Ok(path)
+    })?;
+    let detected = if path.join(".git").exists() {
+        git(&path, &["config", "--get", "remote.origin.url"]).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let (repo, refs) = validated(
         "GitHub repository HTTPS or SSH URL",
         existing
             .as_ref()
             .map(|v| v.repo.as_str())
             .unwrap_or(&detected),
+        |input| {
+            if !valid_repo(input) {
+                return fail("Use https://github.com/OWNER/REPO or git@github.com:OWNER/REPO.git.");
+            }
+            let cwd = env::current_dir()?;
+            let refs = repository_refs(if path.is_dir() { &path } else { &cwd }, input)?;
+            Ok((input.to_owned(), refs))
+        },
     )?;
-    if !valid_repo(&repo) {
-        return fail("Use https://github.com/OWNER/REPO or git@github.com:OWNER/REPO.git.");
-    }
-    let default_branch =
-        git(&path, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "main".into());
-    let b = prompt(
+    let local_branch = if path.join(".git").exists() {
+        Some(git(&path, &["symbolic-ref", "--short", "HEAD"])?)
+    } else {
+        None
+    };
+    let default_branch = local_branch.as_deref().unwrap_or("main");
+    let b = validated(
         "Branch",
         existing
             .as_ref()
             .map(|v| v.branch.as_str())
-            .unwrap_or(&default_branch),
+            .unwrap_or(default_branch),
+        |input| {
+            git(Path::new("."), &["check-ref-format", "--branch", input])?;
+            let remote_branch = format!("refs/heads/{input}");
+            if mode == "2"
+                && !refs
+                    .lines()
+                    .any(|line| line.split_whitespace().nth(1) == Some(remote_branch.as_str()))
+            {
+                return fail(
+                    "This branch does not exist on GitHub. Enter an existing remote branch.",
+                );
+            }
+            if mode != "2"
+                && local_branch
+                    .as_ref()
+                    .is_some_and(|current| current != input)
+            {
+                return fail(&format!(
+                    "Local repository is on branch '{}'. Enter that branch, or cancel and switch branches using Git first.",
+                    local_branch.as_deref().unwrap()
+                ));
+            }
+            Ok(input.to_owned())
+        },
     )?;
-    git(Path::new("."), &["check-ref-format", "--branch", &b])?;
-    println!(
-        "1. Upload local vault to GitHub\n2. Download GitHub vault into a new or empty folder\n3. Connect existing local Git repository (configuration only)"
-    );
-    let mode = prompt("Workflow", if existing.is_some() { "3" } else { "1" })?;
-    if !["1", "2", "3"].contains(&mode.as_str()) {
-        return fail("Choose 1, 2, or 3.");
-    }
     if mode == "2" {
         if path.exists() && fs::read_dir(&path)?.next().is_some() {
             return fail("Download requires a new or empty destination folder.");
@@ -454,6 +566,7 @@ fn setup(c: &mut Config, cp: &Path, name: &str) -> Result<()> {
         branch: b,
     };
     ready(&v)?;
+    println!("OK: Local repository connected.");
     if mode == "1" {
         fetch(&v)?;
         let old = remote_oid(&v)?;
