@@ -4,7 +4,13 @@ A Rust CLI for keeping a local Obsidian vault in a GitHub repository, with expli
 
 ## Install globally
 
-Install [Rust](https://rustup.rs/) and Git, then from this source directory:
+Install [Rust](https://rustup.rs/) and Git, then install directly from GitHub:
+
+```sh
+cargo install --git https://github.com/Dhaneshen1810/obvault --locked
+```
+
+Or install from this source directory:
 
 ```sh
 cargo install --path . --locked
