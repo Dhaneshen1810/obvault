@@ -28,7 +28,7 @@ obvault setup --vault work
 
 Choose a workflow first, then select a detected Obsidian vault or enter a path. Every entry is checked immediately: successful steps print `OK`, while invalid entries explain the problem and repeat the same prompt. Repository validation checks access using existing Git authentication; offline or inaccessible repositories must be corrected before continuing. Download setup also checks that the remote branch exists. Ctrl+C cancels setup. Accepts spaces, relative paths and `~`. Supply a GitHub HTTPS or SSH URL and a branch. Workflows:
 
-1. **Upload local vault:** initialize Git when necessary, add ignore rules, commit and upload. If the remote branch cannot be advanced normally, setup explicitly asks before replacing it. It first creates and verifies `obvault-backup-<timestamp>` on GitHub, then uses a lease-protected push. Backup failure or a changed remote branch prevents replacement. Any backup already created is retained.
+1. **Upload local vault:** initialize Git when necessary, add ignore rules, commit and upload. All questions are asked before anything is committed; answering no undoes any Git setup it started, so the folder is left as it was. An empty GitHub repository works best. If the repository only contains files GitHub adds when creating it (README, LICENSE, `.gitignore`, `.gitattributes`), they are kept alongside your vault, and your vault's version wins when names match. If the remote branch holds other history that cannot be advanced normally, setup explicitly asks before replacing it. It first creates and verifies `obvault-backup-<timestamp>` on GitHub, then uses a lease-protected push. Backup failure or a changed remote branch prevents replacement. Any backup already created is retained.
 2. **Download:** clone an existing remote branch into a new or empty destination.
 3. **Connect existing:** save configuration for an existing checkout without syncing. Changing origin requires confirmation.
 
@@ -74,4 +74,4 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Tests use temporary local repositories, never your vault or GitHub account. CI checks macOS, Windows and Linux. MIT licensed.
+Tests use temporary local repositories with their own Git configuration; they never touch your vault, GitHub account, or global Git settings (signing, hooks). CI checks macOS, Windows and Linux. MIT licensed.
